@@ -187,6 +187,135 @@ function Get-DomainRegistrar {
     }
 }
 
+function Get-DomainExpiryDate {
+    param([string]$domain)
+    
+    try {
+        # Try RDAP first (modern protocol)
+        $rdap = Invoke-RestMethod -Uri "https://rdap.org/domain/$domain" -TimeoutSec 5 -ErrorAction SilentlyContinue
+        
+        if ($rdap -and $rdap.events) {
+            # Look for expiration event in RDAP
+            $expiryEvent = $rdap.events | Where-Object { $_.eventAction -eq "expiration" } | Select-Object -First 1
+            if ($expiryEvent -and $expiryEvent.eventDate) {
+                try {
+                    $expiryDate = [DateTime]::Parse($expiryEvent.eventDate)
+                    return @{
+                        ExpiryDate = $expiryDate
+                        DaysUntilExpiry = ($expiryDate - (Get-Date)).Days
+                        Status = "Active"
+                    }
+                } catch {
+                    # If parsing fails, return raw string
+                    return @{
+                        ExpiryDate = $expiryEvent.eventDate
+                        DaysUntilExpiry = "N/A"
+                        Status = "Active"
+                    }
+                }
+            }
+        }
+        
+        # Fallback to WHOIS via whois.domaintools.com (more reliable)
+        try {
+            $whois = Invoke-RestMethod -Uri "https://whois.domaintools.com/$domain" -TimeoutSec 5 -ErrorAction SilentlyContinue
+            
+            if ($whois -is [string]) {
+                # Parse common expiry date patterns
+                $patterns = @(
+                    "Expir.*?:(.*?)(?:\n|$)",
+                    "Expir.*?Date:(.*?)(?:\n|$)",
+                    "Registry Expir.*?:(.*?)(?:\n|$)",
+                    "Expiration Date:(.*?)(?:\n|$)",
+                    "Expires On:(.*?)(?:\n|$)"
+                )
+                
+                foreach ($pattern in $patterns) {
+                    if ($whois -match $pattern) {
+                        $dateStr = $matches[1].Trim()
+                        try {
+                            $expiryDate = [DateTime]::Parse($dateStr)
+                            return @{
+                                ExpiryDate = $expiryDate
+                                DaysUntilExpiry = ($expiryDate - (Get-Date)).Days
+                                Status = "Active"
+                            }
+                        } catch {
+                            # Try different date formats
+                            $formats = @(
+                                "yyyy-MM-dd",
+                                "dd/MM/yyyy",
+                                "MM/dd/yyyy",
+                                "yyyy/MM/dd",
+                                "dd-MMM-yyyy",
+                                "d-MMM-yyyy",
+                                "yyyy-MM-ddTHH:mm:ssZ",
+                                "yyyy-MM-ddTHH:mm:ss.fffZ"
+                            )
+                            
+                            foreach ($format in $formats) {
+                                try {
+                                    $expiryDate = [DateTime]::ParseExact($dateStr, $format, [System.Globalization.CultureInfo]::InvariantCulture)
+                                    return @{
+                                        ExpiryDate = $expiryDate
+                                        DaysUntilExpiry = ($expiryDate - (Get-Date)).Days
+                                        Status = "Active"
+                                    }
+                                } catch {
+                                    continue
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch {
+            # WHOIS failed, continue to next method
+        }
+        
+        # Fallback to system WHOIS command if available
+        try {
+            # This works on Unix/Linux systems
+            if (Get-Command whois -ErrorAction SilentlyContinue) {
+                $whoisOutput = whois $domain
+                if ($whoisOutput -match "Expir.*?Date:\s*(.+)$") {
+                    $dateStr = $matches[1].Trim()
+                    try {
+                        $expiryDate = [DateTime]::Parse($dateStr)
+                        return @{
+                            ExpiryDate = $expiryDate
+                            DaysUntilExpiry = ($expiryDate - (Get-Date)).Days
+                            Status = "Active"
+                        }
+                    } catch {
+                        # Return raw string if parsing fails
+                        return @{
+                            ExpiryDate = $dateStr
+                            DaysUntilExpiry = "N/A"
+                            Status = "Active"
+                        }
+                    }
+                }
+            }
+        } catch {
+            # whois command failed
+        }
+        
+        return @{
+            ExpiryDate = "N/A"
+            DaysUntilExpiry = "N/A"
+            Status = "Unknown"
+        }
+        
+    } catch {
+        return @{
+            ExpiryDate = "Error"
+            DaysUntilExpiry = "N/A"
+            Status = "Error"
+        }
+    }
+}
+
 function Test-HTTPSFirst {
     param([string]$domain)
     
@@ -345,6 +474,8 @@ $successCount = 0
 $httpsCount = 0
 $cdnCount = 0
 $redirectCount = 0
+$expiringSoonCount = 0
+$expiredCount = 0
 
 foreach ($domainObj in $domainList) {
     $originalDomain = $domainObj.Domain.Trim()
@@ -446,6 +577,11 @@ foreach ($domainObj in $domainList) {
         Registrar = "N/A"
         ISP = "N/A"
         
+        # Domain Expiry Info - NEW FIELDS
+        Expiry_Date = "N/A"
+        Days_Until_Expiry = "N/A"
+        Domain_Status = "N/A"
+        
         # Redirect Information
         Has_Redirects = $hasRedirects
         Redirect_Count = $redirectChain.Count
@@ -509,6 +645,21 @@ foreach ($domainObj in $domainList) {
         $registrar = Get-DomainRegistrar -domain $originalDomain
         $result.Registrar = $registrar
         
+        # Domain Expiry Date - NEW FUNCTION CALL
+        $expiryInfo = Get-DomainExpiryDate -domain $originalDomain
+        $result.Expiry_Date = $expiryInfo.ExpiryDate
+        $result.Days_Until_Expiry = $expiryInfo.DaysUntilExpiry
+        $result.Domain_Status = $expiryInfo.Status
+        
+        # Count expiry stats
+        if ($expiryInfo.DaysUntilExpiry -ne "N/A" -and $expiryInfo.DaysUntilExpiry -ne "Error") {
+            if ($expiryInfo.DaysUntilExpiry -lt 0) {
+                $expiredCount++
+            } elseif ($expiryInfo.DaysUntilExpiry -lt 30) {
+                $expiringSoonCount++
+            }
+        }
+        
     } catch {
         # Silent error - just continue
     }
@@ -548,13 +699,15 @@ Write-Host "Domains processed: $counter" -ForegroundColor Yellow
 Write-Host "Output file: $OutputCsv" -ForegroundColor Yellow
 Write-Host "$("=" * 60)" -ForegroundColor Cyan
 
-# Minimal statistics
+# Statistics with expiry info
 if ($counter -gt 0) {
     Write-Host "`nQuick Stats:" -ForegroundColor Cyan
     Write-Host "  HTTPS: $httpsCount/$counter" -ForegroundColor Gray
     Write-Host "  HTTP: $($counter - $httpsCount)/$counter" -ForegroundColor Gray
     Write-Host "  CDN detected: $cdnCount/$counter" -ForegroundColor Gray
     Write-Host "  200 OK: $successCount/$counter" -ForegroundColor Gray
+    Write-Host "  Expiring in 30 days: $expiringSoonCount" -ForegroundColor Yellow
+    Write-Host "  Already expired: $expiredCount" -ForegroundColor Red
 }
 
 # Copy to compared folder
