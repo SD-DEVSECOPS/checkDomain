@@ -131,7 +131,7 @@ function Get-BaseDomain {
     
     $lastTwo = $parts[-2..-1] -join '.'
 
-    # IMPORTANT: For expiry/registrar, you want registrable domain (e.g. sandoz.com)
+   
     if ($RegistrableOnly) {
         if (($ccSLDs -contains $lastTwo) -and ($parts.Count -ge 3)) {
             return ($parts[-3..-1] -join '.')
@@ -572,7 +572,7 @@ function Get-DomainExpiryDate {
         } catch {}
     }
 
-    # METHOD 2b: .by WHOIS via TCP (cctld)  <-- FIX: makes sandoz.by return expiry
+ 
     if ($tld -eq "by" -and -not $expiryInfo) {
         try {
             $byWhois = Invoke-WhoisQuery -Server "whois.cctld.by" -Query $baseDomain
@@ -1028,3 +1028,4 @@ try {
         Copy-Item -Path $OutputCsv -Destination $compareFile -Force
     }
 } catch { }
+
