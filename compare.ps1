@@ -12,6 +12,14 @@
 # - SIMPLE + CORRECT counting using Measure-Object (no .Count)
 # - Dashboard percentages based on CURRENT WEEK domains (deleted excluded)
 # - Adds "Total Domain Changes" = New + Modified + Deleted
+#
+# Added (THIS UPDATE):
+# - HTML row selection (checkboxes)
+# - Export Selected to CSV (client-side download)
+# - Export Selected to PDF (Print dialog -> Save as PDF)
+#
+# Critical bug fixed:
+# - Removed nested </script> inside JS string (was breaking the page script)
 # ============================================================================
 
 Set-StrictMode -Version Latest
@@ -67,6 +75,7 @@ function Create-HTMLComparisonReport {
 <!DOCTYPE html>
 <html>
 <head>
+    <meta charset="utf-8"/>
     <title>Domain Comparison Report - $(Get-Date -Format 'yyyy-MM-dd')</title>
     <style>
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; background-color: #f5f5f5; }
@@ -121,6 +130,18 @@ function Create-HTMLComparisonReport {
 
         .controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 20px 0; }
         .controls select, .controls input { padding: 6px 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; }
+
+        .controls button {
+            padding: 7px 12px;
+            border: 1px solid #bbb;
+            background: #ffffff;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        .controls button:hover { background: #f2f2f2; }
+
+        .select-col { width: 46px; }
     </style>
 
     <script>
@@ -143,6 +164,7 @@ function Create-HTMLComparisonReport {
                 var matchSearch = (!q) || domain.includes(q);
                 row.style.display = (matchFilter && matchSearch) ? '' : 'none';
             });
+            updateSelectedCount();
         }
 
         function applySort() {
@@ -165,7 +187,161 @@ function Create-HTMLComparisonReport {
             applyFilters();
         }
 
-        document.addEventListener('DOMContentLoaded', function() { applyFilters(); });
+        function updateSelectedCount() {
+            var checked = document.querySelectorAll('tbody .rowSelector:checked').length;
+            var el = document.getElementById('selectedCount');
+            if (el) el.textContent = checked ? (checked + " row(s) selected") : "";
+        }
+
+        function toggleSelectAll(master) {
+            var boxes = document.querySelectorAll('tbody .rowSelector');
+            boxes.forEach(function(cb){
+                var tr = cb.closest('tr');
+                if (tr && tr.style.display !== 'none') cb.checked = master.checked;
+            });
+            updateSelectedCount();
+        }
+
+        document.addEventListener('change', function(e){
+            if (e.target && e.target.classList && e.target.classList.contains('rowSelector')) {
+                updateSelectedCount();
+            }
+        });
+
+        function escapeHtml(s){
+            s = (s || "").toString();
+            return s
+              .replace(/&/g,"&amp;")
+              .replace(/</g,"&lt;")
+              .replace(/>/g,"&gt;")
+              .replace(/"/g,"&quot;")
+              .replace(/'/g,"&#039;");
+        }
+
+        function getSelectedRowsData() {
+            var selected = [];
+            var rows = document.querySelectorAll('tbody tr');
+            rows.forEach(function(tr){
+                var cb = tr.querySelector('.rowSelector');
+                if (!cb || !cb.checked) return;
+
+                var cells = tr.querySelectorAll('td');
+
+                // cells[0] = checkbox
+                var domain = (cells[1] && cells[1].innerText || '').trim();
+                var status = (cells[2] && cells[2].innerText || '').trim();
+                var ip     = (cells[3] && cells[3].innerText || '').trim();
+                var http   = (cells[4] && cells[4].innerText || '').trim();
+                var cdn    = (cells[5] && cells[5].innerText || '').trim();
+                var changes= (cells[6] && cells[6].innerText || '').trim().replace(/\\s+/g,' ');
+                var first  = (cells[7] && cells[7].innerText || '').trim();
+                var details= (cells[8] && cells[8].innerText || '').trim().replace(/\\s+/g,' ');
+
+                selected.push({
+                    "Domain": domain,
+                    "Status": status,
+                    "Current IP": ip,
+                    "Current Status": http,
+                    "Current CDN": cdn,
+                    "Changes": changes,
+                    "First Seen": first,
+                    "Details": details
+                });
+            });
+            return selected;
+        }
+
+        function exportSelectedToCSV() {
+            var data = getSelectedRowsData();
+            if (!data.length) { alert("No rows selected."); return; }
+
+            var headers = ["Domain","Status","Current IP","Current Status","Current CDN","Changes","First Seen","Details"];
+            var lines = [];
+            lines.push(headers.join(","));
+
+            data.forEach(function(r){
+                var row = [
+                    r["Domain"], r["Status"], r["Current IP"], r["Current Status"], r["Current CDN"], r["Changes"], r["First Seen"], r["Details"]
+                ].map(function(v){
+                    v = (v || "").toString();
+                    v = v.replace(/"/g,'""');
+                    if (/[",\\n]/.test(v)) v = '"' + v + '"';
+                    return v;
+                }).join(",");
+                lines.push(row);
+            });
+
+            var blob = new Blob([lines.join("\\n")], {type:"text/csv;charset=utf-8;"});
+            var url = URL.createObjectURL(blob);
+
+            var a = document.createElement("a");
+            a.href = url;
+            a.download = "domain_comparison_selected.csv";
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+
+        function exportSelectedToPDF() {
+            var data = getSelectedRowsData();
+            if (!data.length) { alert("No rows selected."); return; }
+
+            var w = window.open("", "_blank");
+            if (!w) { alert("Popup blocked. Please allow popups for this file/site, then try again."); return; }
+
+            // Build HTML WITHOUT putting <script> inside the string (prevents breaking the main page script)
+            var parts = [];
+            parts.push('<!DOCTYPE html>');
+            parts.push('<html><head><meta charset="utf-8"/>');
+            parts.push('<title>Selected Domain Rows</title>');
+            parts.push('<style>');
+            parts.push('body{font-family:Segoe UI,Arial,sans-serif;margin:20px;}');
+            parts.push('h1{margin:0 0 10px 0;font-size:18px;}');
+            parts.push('p{margin:0 0 15px 0;color:#555;}');
+            parts.push('table{width:100%;border-collapse:collapse;font-size:12px;}');
+            parts.push('th,td{border:1px solid #ccc;padding:6px 8px;vertical-align:top;}');
+            parts.push('th{background:#f0f0f0;}');
+            parts.push('.wrap{white-space:normal;}');
+            parts.push('</style></head><body>');
+            parts.push('<h1>Selected Domain Rows</h1>');
+            parts.push('<p>Generated: ' + escapeHtml(new Date().toLocaleString()) + '</p>');
+            parts.push('<table><thead><tr>');
+            parts.push('<th>Domain</th><th>Status</th><th>Current IP</th><th>Current Status</th><th>Current CDN</th><th>Changes</th><th>First Seen</th><th>Details</th>');
+            parts.push('</tr></thead><tbody>');
+
+            for (var i = 0; i < data.length; i++) {
+                var r = data[i];
+                parts.push('<tr>');
+                parts.push('<td>' + escapeHtml(r["Domain"]) + '</td>');
+                parts.push('<td>' + escapeHtml(r["Status"]) + '</td>');
+                parts.push('<td>' + escapeHtml(r["Current IP"]) + '</td>');
+                parts.push('<td>' + escapeHtml(r["Current Status"]) + '</td>');
+                parts.push('<td>' + escapeHtml(r["Current CDN"]) + '</td>');
+                parts.push('<td class="wrap">' + escapeHtml(r["Changes"]) + '</td>');
+                parts.push('<td>' + escapeHtml(r["First Seen"]) + '</td>');
+                parts.push('<td class="wrap">' + escapeHtml(r["Details"]) + '</td>');
+                parts.push('</tr>');
+            }
+
+            parts.push('</tbody></table>');
+            parts.push('</body></html>');
+
+            w.document.open();
+            w.document.write(parts.join(''));
+            w.document.close();
+
+            // Print after the new window finishes loading
+            w.onload = function() {
+                w.focus();
+                w.print();
+            };
+        }
+
+        document.addEventListener('DOMContentLoaded', function() {
+            applyFilters();
+            updateSelectedCount();
+        });
     </script>
 </head>
 
@@ -246,11 +422,16 @@ function Create-HTMLComparisonReport {
             </select>
 
             <input id="searchBox" type="text" placeholder="Search domain..." oninput="applyFilters()" style="min-width:240px;" />
+
+            <button type="button" onclick="exportSelectedToCSV()">Export Selected to CSV</button>
+            <button type="button" onclick="exportSelectedToPDF()">Export Selected to PDF</button>
+            <span id="selectedCount" style="margin-left:10px; color:#2c3e50;"></span>
         </div>
 
         <table>
             <thead>
                 <tr>
+                    <th class="select-col"><input type="checkbox" id="selectAll" onclick="toggleSelectAll(this)" title="Select all visible rows"/></th>
                     <th>Domain</th>
                     <th>Status</th>
                     <th>Current IP</th>
@@ -300,6 +481,7 @@ function Create-HTMLComparisonReport {
 
         $html += @"
                 <tr class="$rowClass" data-status="$statusKey" data-domain="$domainAttr" data-changes="$changesAttr">
+                    <td class="select-col"><input type="checkbox" class="rowSelector" /></td>
                     <td><strong>$($row.Domain)</strong></td>
                     <td><span class="badge $badgeClass">$statusLabel</span></td>
                     <td>$($row.Current_IP)</td>
@@ -624,7 +806,8 @@ foreach ($file in $latestFiles) {
 }
 
 Write-Host "`n$('=' * 70)" -ForegroundColor Cyan
-Write-Host "To view the colored report, open the HTML file in your browser." -ForegroundColor Yellow
+Write-Host "To export selected rows: open the HTML report, tick checkboxes, then use Export buttons." -ForegroundColor Yellow
+Write-Host "For PDF: Export Selected to PDF opens a print dialog -> choose 'Save as PDF'." -ForegroundColor Yellow
 Write-Host "$('=' * 70)" -ForegroundColor Cyan
 
 Write-Host "`nComparison script completed successfully!" -ForegroundColor Green
