@@ -95,11 +95,13 @@ $cdnPatterns = @{
     "Microsoft" = @("microsoft", "azure", "8075", "MSFT")
 }
 
-# ---------------------------------------------------------------------------
-# FIXED: Better base-domain detection for deep subdomains (solar.educacao... etc)
-# ---------------------------------------------------------------------------
 function Get-BaseDomain {
-    param([string]$domain)
+    param(
+        [string]$domain,
+        [switch]$RegistrableOnly
+    )
+
+    if ($null -eq $domain) { $domain = "" }
 
     # Clean domain
     $domain = $domain.Trim()
@@ -109,32 +111,69 @@ function Get-BaseDomain {
 
     if ([string]::IsNullOrWhiteSpace($domain)) { return $domain }
 
+    # Remove www. prefix
+    $domain = $domain -replace '^www\.', ''
+    
     $parts = $domain.Split('.') | Where-Object { $_ -and $_.Trim() -ne "" }
     if ($parts.Count -le 2) { return $domain }
+    
+    # Common ccTLD second-level domain patterns (like .co.uk, .com.au)
+    $ccSLDs = @(
+        "co.uk", "org.uk", "me.uk", "net.uk", "ltd.uk", "plc.uk",
+        "com.au", "net.au", "org.au", "edu.au", "gov.au",
+        "co.nz", "org.nz", "net.nz", "maori.nz",
+        "co.jp", "or.jp", "ne.jp", "ac.jp", "go.jp",
+        "co.kr", "or.kr", "ne.kr", "re.kr", "pe.kr",
+        "co.za", "org.za", "net.za", "web.za",
+        "com.sg", "edu.sg", "gov.sg", "net.sg", "org.sg",
+        "co.in", "org.in", "net.in", "gen.in", "firm.in"
+    )
+    
+    $lastTwo = $parts[-2..-1] -join '.'
+
+    # IMPORTANT: For expiry/registrar, you want registrable domain (e.g. sandoz.com)
+    if ($RegistrableOnly) {
+        if (($ccSLDs -contains $lastTwo) -and ($parts.Count -ge 3)) {
+            return ($parts[-3..-1] -join '.')
+        } else {
+            return ($parts[-2..-1] -join '.')
+        }
+    }
+
+    # Existing behavior kept (DNS zone probing) for other uses
+    if (($ccSLDs -contains $lastTwo) -and ($parts.Count -ge 3)) {
+        $startFrom = 3
+    } else {
+        $startFrom = 2
+    }
 
     function Test-Zone {
         param([string]$name)
         try {
-            $ns = Resolve-DnsName -Name $name -Type NS -ErrorAction SilentlyContinue
+            $ns = Resolve-DnsName -Name $name -Type NS -ErrorAction SilentlyContinue -DnsOnly
             if ($ns) { return $true }
         } catch {}
         try {
-            $soa = Resolve-DnsName -Name $name -Type SOA -ErrorAction SilentlyContinue
+            $soa = Resolve-DnsName -Name $name -Type SOA -ErrorAction SilentlyContinue -DnsOnly
             if ($soa) { return $true }
         } catch {}
         return $false
     }
 
     $maxParts = [Math]::Min(6, $parts.Count)
-    for ($i = 2; $i -le $maxParts; $i++) {
+    for ($i = $startFrom; $i -le $maxParts; $i++) {
         $candidate = ($parts[-$i..-1] -join '.')
         if ($candidate -match "^\d+\.\d+\.\d+\.\d+$") { continue }
         if ($candidate.Length -lt 4) { continue }
-
         if (Test-Zone $candidate) { return $candidate }
     }
 
-    return ($parts[-2..-1] -join '.')
+    # Fallback
+    if (($ccSLDs -contains $lastTwo) -and ($parts.Count -ge 3)) {
+        return ($parts[-3..-1] -join '.')
+    } else {
+        return ($parts[-2..-1] -join '.')
+    }
 }
 
 function Get-IPGeolocation {
@@ -200,9 +239,6 @@ function Detect-CDN {
     return "None"
 }
 
-# ---------------------------------------------------------------------------
-# FIXED: DNS registrar detection now checks BOTH host + base domain
-# ---------------------------------------------------------------------------
 function Get-RegistrarFromDNS {
     param([string]$domain)
     
@@ -214,7 +250,7 @@ function Get-RegistrarFromDNS {
 
         if ([string]::IsNullOrWhiteSpace($domain)) { return "Unknown" }
 
-        $base = Get-BaseDomain $domain
+        $base = Get-BaseDomain -domain $domain -RegistrableOnly
 
         $namesToTry = @($domain, $base) | Where-Object { $_ -and $_.Trim() -ne "" } | Select-Object -Unique
 
@@ -266,9 +302,7 @@ function Get-RegistrarFromDNS {
             }
         }
         
-    } catch {
-        # Silent fail
-    }
+    } catch { }
     
     return "Unknown"
 }
@@ -276,47 +310,32 @@ function Get-RegistrarFromDNS {
 function Get-DomainRegistrar {
     param([string]$domain)
     
-    # Clean the domain first
     $domain = $domain.Trim()
     $domain = $domain -replace '^https?://', ''
     $domain = $domain -replace '/.*$', ''
     
-    # METHOD 1: Try DNS-based detection first (now tries host + base)
     $dnsRegistrar = Get-RegistrarFromDNS -domain $domain
-    if ($dnsRegistrar -ne "Unknown") {
-        return $dnsRegistrar
-    }
+    if ($dnsRegistrar -ne "Unknown") { return $dnsRegistrar }
     
-    # METHOD 2: Try RDAP with base domain
-    $baseDomain = Get-BaseDomain -domain $domain
+    $baseDomain = Get-BaseDomain -domain $domain -RegistrableOnly
     try {
         $rdap = Invoke-RestMethod -Uri "https://rdap.org/domain/$baseDomain" -TimeoutSec 5 -ErrorAction SilentlyContinue
-        
         if ($rdap -and $rdap.entities) {
-            $registrarEntity = $rdap.entities | Where-Object { 
-                $_.roles -contains "registrar" 
-            } | Select-Object -First 1
-            
+            $registrarEntity = $rdap.entities | Where-Object { $_.roles -contains "registrar" } | Select-Object -First 1
             if ($registrarEntity) {
                 if ($registrarEntity.vcardArray -and $registrarEntity.vcardArray[1]) {
                     foreach ($vcard in $registrarEntity.vcardArray[1]) {
-                        if ($vcard[0] -eq "fn" -or $vcard[0] -eq "org") {
-                            return $vcard[3].Trim()
-                        }
+                        if ($vcard[0] -eq "fn" -or $vcard[0] -eq "org") { return $vcard[3].Trim() }
                     }
                 }
                 return $registrarEntity.name.Trim()
             }
         }
-    } catch {
-        # RDAP failed
-    }
+    } catch { }
     
-    # METHOD 3: Try system WHOIS if available
     if (Get-Command whois -ErrorAction SilentlyContinue) {
         try {
             $whoisOutput = whois $baseDomain 2>&1 | Out-String
-            
             $patterns = @(
                 "Registrar:\s*(.+)",
                 "Registrar\s+Name:\s*(.+)",
@@ -324,22 +343,19 @@ function Get-DomainRegistrar {
                 "Registration\s+Service\s+Provider:\s*(.+)",
                 "Registrar\s+Organization:\s*(.+)"
             )
-            
             foreach ($pattern in $patterns) {
                 if ($whoisOutput -match $pattern) {
                     $found = $matches[1].Trim()
                     if ($found -and $found -ne "" -and $found -notmatch "^\d+$") {
                         $found = $found -replace '\(http[^)]+\)', ''
                         $found = $found -replace 'https?://[^\s]+', ''
-                        $found = $found.Trim()
-                        return $found
+                        return $found.Trim()
                     }
                 }
             }
-        } catch {}
+        } catch { }
     }
     
-    # METHOD 4: last try NS patterns (use base domain, not host)
     $commonRegistrars = @{
         "markmonitor" = "MarkMonitor"
         "cloudflare" = "Cloudflare"
@@ -369,126 +385,283 @@ function Get-DomainRegistrar {
                 }
             }
         }
-    } catch {}
+    } catch { }
     
     return "Unknown"
+}
+
+function Invoke-WhoisQuery {
+    param(
+        [Parameter(Mandatory=$true)][string]$Server,
+        [Parameter(Mandatory=$true)][string]$Query,
+        [int]$TimeoutMs = 6000
+    )
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $client.ReceiveTimeout = $TimeoutMs
+        $client.SendTimeout = $TimeoutMs
+
+        $iar = $client.BeginConnect($Server, 43, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs)) {
+            try { $client.Close() } catch {}
+            return $null
+        }
+        $client.EndConnect($iar) | Out-Null
+
+        $stream = $client.GetStream()
+        $writer = New-Object System.IO.StreamWriter($stream, [Text.Encoding]::ASCII)
+        $writer.NewLine = "`r`n"
+        $writer.WriteLine($Query)
+        $writer.Flush()
+
+        $reader = New-Object System.IO.StreamReader($stream, [Text.Encoding]::ASCII)
+        $sb = New-Object System.Text.StringBuilder
+        while ($true) {
+            $line = $reader.ReadLine()
+            if ($null -eq $line) { break }
+            [void]$sb.AppendLine($line)
+        }
+
+        try { $reader.Close() } catch {}
+        try { $writer.Close() } catch {}
+        try { $stream.Close() } catch {}
+        try { $client.Close() } catch {}
+
+        $text = $sb.ToString()
+        if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+        return $text
+    } catch {
+        return $null
+    }
 }
 
 function Get-DomainExpiryDate {
     param([string]$domain)
     
-    # Get base domain for expiry checking
-    $baseDomain = Get-BaseDomain -domain $domain
+    # IMPORTANT: expiry is defined on the registrable domain (subdomains inherit it)
+    $baseDomain = Get-BaseDomain -domain $domain -RegistrableOnly
     
-    try {
-        $rdap = Invoke-RestMethod -Uri "https://rdap.org/domain/$baseDomain" -TimeoutSec 5 -ErrorAction SilentlyContinue
-        
-        if ($rdap -and $rdap.events) {
-            $expiryEvent = $rdap.events | Where-Object { $_.eventAction -eq "expiration" } | Select-Object -First 1
-            if ($expiryEvent -and $expiryEvent.eventDate) {
-                try {
-                    $expiryDate = [DateTime]::Parse($expiryEvent.eventDate)
-                    return @{
-                        ExpiryDate = $expiryDate
-                        DaysUntilExpiry = ($expiryDate - (Get-Date)).Days
-                        Status = "Active"
-                    }
-                } catch {
-                    return @{
-                        ExpiryDate = $expiryEvent.eventDate
-                        DaysUntilExpiry = "N/A"
-                        Status = "Active"
-                    }
-                }
-            }
-        }
-        
-        try {
-            $whois = Invoke-RestMethod -Uri "https://whois.domaintools.com/$baseDomain" -TimeoutSec 5 -ErrorAction SilentlyContinue
-            
-            if ($whois -is [string]) {
-                $patterns = @(
-                    "Expir.*?:(.*?)(?:\n|$)",
-                    "Expir.*?Date:(.*?)(?:\n|$)",
-                    "Registry Expir.*?:(.*?)(?:\n|$)",
-                    "Expiration Date:(.*?)(?:\n|$)",
-                    "Expires On:(.*?)(?:\n|$)"
-                )
-                
-                foreach ($pattern in $patterns) {
-                    if ($whois -match $pattern) {
-                        $dateStr = $matches[1].Trim()
-                        try {
-                            $expiryDate = [DateTime]::Parse($dateStr)
-                            return @{
-                                ExpiryDate = $expiryDate
-                                DaysUntilExpiry = ($expiryDate - (Get-Date)).Days
-                                Status = "Active"
-                            }
-                        } catch {
-                            $formats = @(
-                                "yyyy-MM-dd",
-                                "dd/MM/yyyy",
-                                "MM/dd/yyyy",
-                                "yyyy/MM/dd",
-                                "dd-MMM-yyyy",
-                                "d-MMM-yyyy",
-                                "yyyy-MM-ddTHH:mm:ssZ",
-                                "yyyy-MM-ddTHH:mm:ss.fffZ"
-                            )
-                            
-                            foreach ($format in $formats) {
-                                try {
-                                    $expiryDate = [DateTime]::ParseExact($dateStr, $format, [System.Globalization.CultureInfo]::InvariantCulture)
-                                    return @{
-                                        ExpiryDate = $expiryDate
-                                        DaysUntilExpiry = ($expiryDate - (Get-Date)).Days
-                                        Status = "Active"
-                                    }
-                                } catch { continue }
-                            }
-                        }
-                    }
-                }
-            }
-        } catch {}
-        
-        try {
-            if (Get-Command whois -ErrorAction SilentlyContinue) {
-                $whoisOutput = whois $baseDomain
-                if ($whoisOutput -match "Expir.*?Date:\s*(.+)$") {
-                    $dateStr = $matches[1].Trim()
-                    try {
-                        $expiryDate = [DateTime]::Parse($dateStr)
-                        return @{
-                            ExpiryDate = $expiryDate
-                            DaysUntilExpiry = ($expiryDate - (Get-Date)).Days
-                            Status = "Active"
-                        }
-                    } catch {
-                        return @{
-                            ExpiryDate = $dateStr
-                            DaysUntilExpiry = "N/A"
-                            Status = "Active"
-                        }
-                    }
-                }
-            }
-        } catch {}
-        
+    $expiryInfo = $null
+
+    function New-ExpiryInfoFromDate {
+        param([DateTime]$dt)
         return @{
-            ExpiryDate = "N/A"
-            DaysUntilExpiry = "N/A"
-            Status = "Unknown"
-        }
-        
-    } catch {
-        return @{
-            ExpiryDate = "Error"
-            DaysUntilExpiry = "N/A"
-            Status = "Error"
+            ExpiryDate = $dt.ToString("yyyy-MM-dd")
+            DaysUntilExpiry = ($dt - (Get-Date)).Days
+            Status = "Active"
         }
     }
+
+    function Try-ParseDateFlexible {
+        param([string]$dateStr)
+
+        if ([string]::IsNullOrWhiteSpace($dateStr)) { return $null }
+
+        $s = $dateStr.Trim()
+
+        $s = $s -replace '\(UTC\).*$', ''
+        $s = $s -replace '\(KST\).*$', ''
+        $s = $s -replace '\.$', ''
+
+        # Handle ISO: 2027-01-16T00:00:00Z
+        $s = $s -replace 'T\d{2}:\d{2}:\d{2}.*$', ''
+        $s = $s -replace '\s+', ' '
+        $s = $s.Trim()
+
+        # Normalize: 2027. 01. 16.  -> 2027-01-16
+        $s = $s -replace '(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\.?', '$1-$2-$3'
+
+        try { return [DateTime]::Parse($s) } catch {}
+
+        $formats = @(
+            "yyyy-MM-dd","yyyy-M-d",
+            "MM/dd/yyyy","M/d/yyyy",
+            "dd/MM/yyyy","d/M/yyyy",
+            "yyyy/MM/dd",
+            "yyyy.M.d","yyyy.MM.dd",
+            "dd-MMM-yyyy","d-MMM-yyyy",
+            "dd.MM.yyyy","d.MM.yyyy",
+            "MM-dd-yyyy","M-d-yyyy",
+            "dd-MM-yyyy","d-M-yyyy"
+        )
+
+        foreach ($f in $formats) {
+            try { return [DateTime]::ParseExact($s, $f, [System.Globalization.CultureInfo]::InvariantCulture) } catch {}
+        }
+
+        return $null
+    }
+
+    function Extract-ExpiryFromText {
+        param([string]$text)
+
+        if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+
+        # NOTE: Verisign uses "Registry Expiry Date:"
+        $patterns = @(
+            '(?im)^\s*Registry\s*Expiry\s*Date\s*:\s*(.+?)\s*$',
+            '(?im)^\s*Expiration\s*Date\s*:\s*(.+?)\s*$',
+            '(?im)^\s*Expiry\s*Date\s*:\s*(.+?)\s*$',
+            '(?im)^\s*Expire\s*Date\s*:\s*(.+?)\s*$',   # <-- FIX: helps .by
+            '(?im)^\s*Expires\s*On\s*:\s*(.+?)\s*$',
+            '(?im)^\s*Expires\s*:\s*(.+?)\s*$',
+            '(?im)^\s*Expire\s*:\s*(.+?)\s*$',
+            '(?im)^\s*Valid\s*Date\s*:\s*(.+?)\s*$',
+            '(?im)^\s*paid-till\s*:\s*(.+?)\s*$',
+            '(?im)^\s*만료일\s*:\s*(.+?)\s*$'
+        )
+
+        foreach ($p in $patterns) {
+            $m = [regex]::Match($text, $p)
+            if ($m.Success) {
+                $raw = $m.Groups[1].Value.Trim()
+                if ($raw -match '^function\(' -or $raw -match '^\s*$') { continue }
+                return $raw
+            }
+        }
+
+        $inlinePatterns = @(
+            '(?i)Registry Expiry Date\W+([0-9]{4}[./-]\s*[0-9]{1,2}[./-]\s*[0-9]{1,2})',
+            '(?i)Expiration Date\W+([0-9]{4}[./-]\s*[0-9]{1,2}[./-]\s*[0-9]{1,2})',
+            '(?i)Expires On\W+([0-9]{4}[./-]\s*[0-9]{1,2}[./-]\s*[0-9]{1,2})',
+            '(?i)Expires\W+([0-9]{4}[./-]\s*[0-9]{1,2}[./-]\s*[0-9]{1,2})',
+            '(?i)Expiration\W+([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})'
+        )
+
+        foreach ($p in $inlinePatterns) {
+            $m = [regex]::Match($text, $p)
+            if ($m.Success) { return $m.Groups[1].Value.Trim() }
+        }
+
+        return $null
+    }
+
+    # METHOD 1: RDAP
+    try {
+        $rdap = Invoke-RestMethod -Uri "https://rdap.org/domain/$baseDomain" -TimeoutSec 5 -ErrorAction SilentlyContinue
+        if ($rdap -and $rdap.events) {
+            $expiryEvent = $rdap.events | Where-Object {
+                $_.eventAction -and ($_.eventAction.ToString().ToLower() -match 'expiration|expiry|expires')
+            } | Select-Object -First 1
+
+            if ($expiryEvent -and $expiryEvent.eventDate) {
+                $dt = Try-ParseDateFlexible -dateStr $expiryEvent.eventDate
+                if ($dt) { return (New-ExpiryInfoFromDate -dt $dt) }
+                return @{ ExpiryDate=$expiryEvent.eventDate; DaysUntilExpiry="N/A"; Status="Active" }
+            }
+        }
+    } catch {}
+
+    $tld = $baseDomain.Split('.')[-1].ToLower()
+
+    # METHOD 2: .kr RDAP
+    if ($tld -eq "kr" -and -not $expiryInfo) {
+        try {
+            $rdapKr = Invoke-RestMethod -Uri "https://rdap.krnic.or.kr/domain/$baseDomain" -TimeoutSec 5 -ErrorAction SilentlyContinue
+            if ($rdapKr -and $rdapKr.events) {
+                $expiryEvent = $rdapKr.events | Where-Object {
+                    $_.eventAction -and ($_.eventAction.ToString().ToLower() -match 'expiration|expiry|expires')
+                } | Select-Object -First 1
+
+                if ($expiryEvent -and $expiryEvent.eventDate) {
+                    $dt = Try-ParseDateFlexible -dateStr $expiryEvent.eventDate
+                    if ($dt) { return (New-ExpiryInfoFromDate -dt $dt) }
+                    return @{ ExpiryDate=$expiryEvent.eventDate; DaysUntilExpiry="N/A"; Status="Active" }
+                }
+            }
+        } catch {}
+    }
+
+    # METHOD 2b: .by WHOIS via TCP (cctld)  <-- FIX: makes sandoz.by return expiry
+    if ($tld -eq "by" -and -not $expiryInfo) {
+        try {
+            $byWhois = Invoke-WhoisQuery -Server "whois.cctld.by" -Query $baseDomain
+            if (-not [string]::IsNullOrWhiteSpace($byWhois)) {
+                $rawDate = Extract-ExpiryFromText -text $byWhois
+                if ($rawDate) {
+                    $dt = Try-ParseDateFlexible -dateStr $rawDate
+                    if ($dt) { return (New-ExpiryInfoFromDate -dt $dt) }
+                    return @{ ExpiryDate=$rawDate; DaysUntilExpiry="N/A"; Status="Active" }
+                }
+            }
+        } catch {}
+    }
+
+    # METHOD 3: IMPORTANT FIX FOR .com/.net SUBDOMAINS (and missing whois command)
+    # Query Verisign directly via TCP. This is usually the most reliable for .com/.net.
+    if ($tld -in @("com","net") -and -not $expiryInfo) {
+        try {
+            $verisign = Invoke-WhoisQuery -Server "whois.verisign-grs.com" -Query $baseDomain
+            if (-not [string]::IsNullOrWhiteSpace($verisign)) {
+                $rawDate = Extract-ExpiryFromText -text $verisign
+                if ($rawDate) {
+                    $dt = Try-ParseDateFlexible -dateStr $rawDate
+                    if ($dt) { return (New-ExpiryInfoFromDate -dt $dt) }
+                    return @{ ExpiryDate=$rawDate; DaysUntilExpiry="N/A"; Status="Active" }
+                }
+            }
+        } catch {}
+    }
+
+    # METHOD 4: whois command (if present) / TCP for .kr
+    if (-not $expiryInfo) {
+        try {
+            $whoisOutput = $null
+
+            if (Get-Command whois -ErrorAction SilentlyContinue) {
+                try {
+                    if ($tld -eq "kr") { $whoisOutput = whois -h whois.krnic.net $baseDomain 2>&1 | Out-String }
+                    else { $whoisOutput = whois $baseDomain 2>&1 | Out-String }
+                } catch { $whoisOutput = $null }
+            }
+
+            if ([string]::IsNullOrWhiteSpace($whoisOutput) -and $tld -eq "kr") {
+                $whoisOutput = Invoke-WhoisQuery -Server "whois.krnic.net" -Query $baseDomain
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($whoisOutput)) {
+                $rawDate = Extract-ExpiryFromText -text $whoisOutput
+                if ($rawDate) {
+                    $dt = Try-ParseDateFlexible -dateStr $rawDate
+                    if ($dt) { return (New-ExpiryInfoFromDate -dt $dt) }
+                    return @{ ExpiryDate=$rawDate; DaysUntilExpiry="N/A"; Status="Active" }
+                }
+            }
+        } catch {}
+    }
+
+    # METHOD 5: domaintools (UseBasicParsing to avoid prompt)
+    if (-not $expiryInfo) {
+        try {
+            $headers = @{ "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" }
+            $whois = Invoke-WebRequest -Uri "https://whois.domaintools.com/$baseDomain" -Headers $headers -TimeoutSec 5 -UseBasicParsing -ErrorAction SilentlyContinue
+            
+            if ($whois -and $whois.Content) {
+                $content = $whois.Content
+                $cleanWhois = $content -replace '<script[^>]*>.*?</script>', ''
+                $cleanWhois = $cleanWhois -replace 'function\(\)\{.*?\}', ''
+                $cleanWhois = $cleanWhois -replace '\s+', ' '
+
+                $rawDate = $null
+                if ($cleanWhois -match "(?i)Registry Expiry Date:\s*([^<\n]+)") { $rawDate = $matches[1].Trim() }
+                elseif ($cleanWhois -match "(?i)Expiration Date:\s*([^<\n]+)") { $rawDate = $matches[1].Trim() }
+                elseif ($cleanWhois -match "(?i)Expires On:\s*([^<\n]+)") { $rawDate = $matches[1].Trim() }
+                elseif ($cleanWhois -match "(?i)Expires:\s*([^<\n]+)") { $rawDate = $matches[1].Trim() }
+
+                if ($rawDate -and $rawDate -notmatch '^function\(') {
+                    $dt = Try-ParseDateFlexible -dateStr $rawDate
+                    if ($dt) { return (New-ExpiryInfoFromDate -dt $dt) }
+                    return @{ ExpiryDate=$rawDate; DaysUntilExpiry="N/A"; Status="Active" }
+                }
+            }
+        } catch {}
+    }
+
+    if (-not $expiryInfo) {
+        $expiryInfo = @{ ExpiryDate="N/A"; DaysUntilExpiry="N/A"; Status="Unknown" }
+    }
+
+    return $expiryInfo
 }
 
 function Test-HTTPSFirst {
@@ -503,7 +676,7 @@ function Test-HTTPSFirst {
     $finalUrl = $httpsUrl
     
     try {
-        $response = Invoke-WebRequest -Uri $httpsUrl -Method Head -TimeoutSec 3 -ErrorAction Stop
+        $response = Invoke-WebRequest -Uri $httpsUrl -Method Head -TimeoutSec 3 -UseBasicParsing -ErrorAction Stop
         $httpsStatus = $response.StatusCode
         $protocol = "https"
         $finalUrl = $httpsUrl
@@ -515,14 +688,10 @@ function Test-HTTPSFirst {
             Status_Summary = "HTTPS: $httpsStatus | HTTP: Not Attempted"
         }
     } catch {
-        if ($_.Exception.Response) {
-            $httpsStatus = $_.Exception.Response.StatusCode
-        } else {
-            $httpsStatus = "No Response"
-        }
+        if ($_.Exception.Response) { $httpsStatus = $_.Exception.Response.StatusCode } else { $httpsStatus = "No Response" }
         
         try {
-            $response = Invoke-WebRequest -Uri $httpUrl -Method Head -TimeoutSec 3 -ErrorAction Stop
+            $response = Invoke-WebRequest -Uri $httpUrl -Method Head -TimeoutSec 3 -UseBasicParsing -ErrorAction Stop
             $httpStatus = $response.StatusCode
             $protocol = "http"
             $finalUrl = $httpUrl
@@ -534,11 +703,7 @@ function Test-HTTPSFirst {
                 Status_Summary = "HTTPS: $httpsStatus | HTTP: $httpStatus"
             }
         } catch {
-            if ($_.Exception.Response) {
-                $httpStatus = $_.Exception.Response.StatusCode
-            } else {
-                $httpStatus = "No Response"
-            }
+            if ($_.Exception.Response) { $httpStatus = $_.Exception.Response.StatusCode } else { $httpStatus = "No Response" }
             
             return @{
                 FinalURL = $finalUrl
@@ -652,7 +817,7 @@ foreach ($domainObj in $domainList) {
     $counter++
     
     Write-Progress -Activity "Processing Domains" -Status "$counter/$total : $originalDomain" -PercentComplete (($counter / $total) * 100)
-    Write-Host "Testing: $originalDomain"
+    Write-Host "Testing: $originalDomain" -ForegroundColor Cyan
     
     # Test HTTP/HTTPS
     $httpTest = Test-HTTPSFirst -domain $originalDomain
@@ -795,26 +960,26 @@ foreach ($domainObj in $domainList) {
             $cdnCount++
         }
         
+        # Always use registrable domain for registrar/expiry (fixes deep subdomains)
+        $baseDomain = Get-BaseDomain -domain $originalDomain -RegistrableOnly
+        
         # Registrar
         $registrar = Get-DomainRegistrar -domain $originalDomain
         $result.Registrar = $registrar
         
-        # Domain Expiry Date
-        $baseDomain = Get-BaseDomain -domain $originalDomain
+        # Expiry
+        Write-Host "  Checking expiry for $baseDomain..." -ForegroundColor DarkGray
         $expiryInfo = Get-DomainExpiryDate -domain $baseDomain
         $result.Expiry_Date = $expiryInfo.ExpiryDate
         $result.Days_Until_Expiry = $expiryInfo.DaysUntilExpiry
         $result.Domain_Status = $expiryInfo.Status
         
-        # Count expiry stats
         if ($expiryInfo.DaysUntilExpiry -ne "N/A" -and $expiryInfo.DaysUntilExpiry -ne "Error") {
             if ($expiryInfo.DaysUntilExpiry -lt 0) { $expiredCount++ }
             elseif ($expiryInfo.DaysUntilExpiry -lt 30) { $expiringSoonCount++ }
         }
         
-    } catch {
-        # Silent error
-    }
+    } catch { }
     
     # Populate redirect details
     for ($i = 0; $i -lt [Math]::Min($redirectChain.Count, 3); $i++) {
@@ -862,6 +1027,4 @@ try {
         $compareFile = "$ComparedFolder\domain_inventory_$DateStamp`_$RandomCode.csv"
         Copy-Item -Path $OutputCsv -Destination $compareFile -Force
     }
-} catch {
-    # Silent error
-}
+} catch { }
