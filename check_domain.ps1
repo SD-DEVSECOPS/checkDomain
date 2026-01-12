@@ -95,6 +95,48 @@ $cdnPatterns = @{
     "Microsoft" = @("microsoft", "azure", "8075", "MSFT")
 }
 
+# ---------------------------------------------------------------------------
+# FIXED: Better base-domain detection for deep subdomains (solar.educacao... etc)
+# ---------------------------------------------------------------------------
+function Get-BaseDomain {
+    param([string]$domain)
+
+    # Clean domain
+    $domain = $domain.Trim()
+    $domain = $domain -replace '^https?://', ''
+    $domain = $domain -replace '/.*$', ''
+    $domain = $domain.Split(':')[0]  # Remove port
+
+    if ([string]::IsNullOrWhiteSpace($domain)) { return $domain }
+
+    $parts = $domain.Split('.') | Where-Object { $_ -and $_.Trim() -ne "" }
+    if ($parts.Count -le 2) { return $domain }
+
+    function Test-Zone {
+        param([string]$name)
+        try {
+            $ns = Resolve-DnsName -Name $name -Type NS -ErrorAction SilentlyContinue
+            if ($ns) { return $true }
+        } catch {}
+        try {
+            $soa = Resolve-DnsName -Name $name -Type SOA -ErrorAction SilentlyContinue
+            if ($soa) { return $true }
+        } catch {}
+        return $false
+    }
+
+    $maxParts = [Math]::Min(6, $parts.Count)
+    for ($i = 2; $i -le $maxParts; $i++) {
+        $candidate = ($parts[-$i..-1] -join '.')
+        if ($candidate -match "^\d+\.\d+\.\d+\.\d+$") { continue }
+        if ($candidate.Length -lt 4) { continue }
+
+        if (Test-Zone $candidate) { return $candidate }
+    }
+
+    return ($parts[-2..-1] -join '.')
+}
+
 function Get-IPGeolocation {
     param([string]$ipAddress)
     
@@ -158,11 +200,97 @@ function Detect-CDN {
     return "None"
 }
 
-function Get-DomainRegistrar {
+# ---------------------------------------------------------------------------
+# FIXED: DNS registrar detection now checks BOTH host + base domain
+# ---------------------------------------------------------------------------
+function Get-RegistrarFromDNS {
     param([string]$domain)
     
     try {
-        $rdap = Invoke-RestMethod -Uri "https://rdap.org/domain/$domain" -TimeoutSec 5 -ErrorAction SilentlyContinue
+        $domain = $domain.Trim()
+        $domain = $domain -replace '^https?://', ''
+        $domain = $domain -replace '/.*$', ''
+        $domain = $domain.Split(':')[0]
+
+        if ([string]::IsNullOrWhiteSpace($domain)) { return "Unknown" }
+
+        $base = Get-BaseDomain $domain
+
+        $namesToTry = @($domain, $base) | Where-Object { $_ -and $_.Trim() -ne "" } | Select-Object -Unique
+
+        $registrarKeywords = @{
+            "markmonitor" = "MarkMonitor"
+            "cloudflare" = "Cloudflare"
+            "godaddy" = "GoDaddy"
+            "namecheap" = "Namecheap"
+            "amazonaws" = "Amazon Route53"
+            "route53" = "Amazon Route53"
+            "googledomains" = "Google Domains"
+            "google" = "Google Domains"
+            "cscdns" = "CSC"
+            "csc" = "CSC"
+            "enom" = "eNom"
+            "tucows" = "Tucows"
+            "networksolutions" = "Network Solutions"
+            "dynadot" = "Dynadot"
+            "porkbun" = "Porkbun"
+            "name.com" = "Name.com"
+            "hostinger" = "Hostinger"
+            "bluehost" = "Bluehost"
+        }
+
+        foreach ($name in $namesToTry) {
+            $records = @()
+
+            try { $r = Resolve-DnsName -Name $name -Type SOA -ErrorAction SilentlyContinue; if ($r) { $records += $r } } catch {}
+            try { $r = Resolve-DnsName -Name $name -Type NS  -ErrorAction SilentlyContinue; if ($r) { $records += $r } } catch {}
+            try { $r = Resolve-DnsName -Name $name -Type MX  -ErrorAction SilentlyContinue; if ($r) { $records += $r } } catch {}
+
+            if (-not $records -or $records.Count -eq 0) { continue }
+
+            foreach ($record in $records) {
+                foreach ($prop in @("PrimaryServer","NameAdministrator","NameHost","NameExchange","MailExchange")) {
+                    $val = $record.$prop
+                    if ($val) {
+                        $low = $val.ToString().ToLowerInvariant()
+                        foreach ($k in $registrarKeywords.Keys) {
+                            if ($low -match $k) { return $registrarKeywords[$k] }
+                        }
+                    }
+                }
+            }
+
+            $recordString = ($records | Out-String).ToLowerInvariant()
+            foreach ($k in $registrarKeywords.Keys) {
+                if ($recordString -match $k) { return $registrarKeywords[$k] }
+            }
+        }
+        
+    } catch {
+        # Silent fail
+    }
+    
+    return "Unknown"
+}
+
+function Get-DomainRegistrar {
+    param([string]$domain)
+    
+    # Clean the domain first
+    $domain = $domain.Trim()
+    $domain = $domain -replace '^https?://', ''
+    $domain = $domain -replace '/.*$', ''
+    
+    # METHOD 1: Try DNS-based detection first (now tries host + base)
+    $dnsRegistrar = Get-RegistrarFromDNS -domain $domain
+    if ($dnsRegistrar -ne "Unknown") {
+        return $dnsRegistrar
+    }
+    
+    # METHOD 2: Try RDAP with base domain
+    $baseDomain = Get-BaseDomain -domain $domain
+    try {
+        $rdap = Invoke-RestMethod -Uri "https://rdap.org/domain/$baseDomain" -TimeoutSec 5 -ErrorAction SilentlyContinue
         
         if ($rdap -and $rdap.entities) {
             $registrarEntity = $rdap.entities | Where-Object { 
@@ -180,22 +308,82 @@ function Get-DomainRegistrar {
                 return $registrarEntity.name.Trim()
             }
         }
-        
-        return "Unknown"
     } catch {
-        return "Error"
+        # RDAP failed
     }
+    
+    # METHOD 3: Try system WHOIS if available
+    if (Get-Command whois -ErrorAction SilentlyContinue) {
+        try {
+            $whoisOutput = whois $baseDomain 2>&1 | Out-String
+            
+            $patterns = @(
+                "Registrar:\s*(.+)",
+                "Registrar\s+Name:\s*(.+)",
+                "Sponsoring\s+Registrar:\s*(.+)",
+                "Registration\s+Service\s+Provider:\s*(.+)",
+                "Registrar\s+Organization:\s*(.+)"
+            )
+            
+            foreach ($pattern in $patterns) {
+                if ($whoisOutput -match $pattern) {
+                    $found = $matches[1].Trim()
+                    if ($found -and $found -ne "" -and $found -notmatch "^\d+$") {
+                        $found = $found -replace '\(http[^)]+\)', ''
+                        $found = $found -replace 'https?://[^\s]+', ''
+                        $found = $found.Trim()
+                        return $found
+                    }
+                }
+            }
+        } catch {}
+    }
+    
+    # METHOD 4: last try NS patterns (use base domain, not host)
+    $commonRegistrars = @{
+        "markmonitor" = "MarkMonitor"
+        "cloudflare" = "Cloudflare"
+        "godaddy" = "GoDaddy"
+        "namecheap" = "Namecheap"
+        "amazonaws" = "Amazon Route53"
+        "route53" = "Amazon Route53"
+        "google" = "Google Domains"
+        "cscdns" = "CSC"
+        "enom" = "eNom"
+        "tucows" = "Tucows"
+        "networksolutions" = "Network Solutions"
+        "dynadot" = "Dynadot"
+        "porkbun" = "Porkbun"
+        "name.com" = "Name.com"
+        "hostinger" = "Hostinger"
+        "bluehost" = "Bluehost"
+    }
+    
+    try {
+        $nsRecords = Resolve-DnsName -Name $baseDomain -Type NS -ErrorAction SilentlyContinue
+        if ($nsRecords) {
+            foreach ($record in $nsRecords) {
+                $ns = $record.NameHost.ToLower()
+                foreach ($key in $commonRegistrars.Keys) {
+                    if ($ns -match $key) { return $commonRegistrars[$key] }
+                }
+            }
+        }
+    } catch {}
+    
+    return "Unknown"
 }
 
 function Get-DomainExpiryDate {
     param([string]$domain)
     
+    # Get base domain for expiry checking
+    $baseDomain = Get-BaseDomain -domain $domain
+    
     try {
-        # Try RDAP first (modern protocol)
-        $rdap = Invoke-RestMethod -Uri "https://rdap.org/domain/$domain" -TimeoutSec 5 -ErrorAction SilentlyContinue
+        $rdap = Invoke-RestMethod -Uri "https://rdap.org/domain/$baseDomain" -TimeoutSec 5 -ErrorAction SilentlyContinue
         
         if ($rdap -and $rdap.events) {
-            # Look for expiration event in RDAP
             $expiryEvent = $rdap.events | Where-Object { $_.eventAction -eq "expiration" } | Select-Object -First 1
             if ($expiryEvent -and $expiryEvent.eventDate) {
                 try {
@@ -206,7 +394,6 @@ function Get-DomainExpiryDate {
                         Status = "Active"
                     }
                 } catch {
-                    # If parsing fails, return raw string
                     return @{
                         ExpiryDate = $expiryEvent.eventDate
                         DaysUntilExpiry = "N/A"
@@ -216,12 +403,10 @@ function Get-DomainExpiryDate {
             }
         }
         
-        # Fallback to WHOIS via whois.domaintools.com (more reliable)
         try {
-            $whois = Invoke-RestMethod -Uri "https://whois.domaintools.com/$domain" -TimeoutSec 5 -ErrorAction SilentlyContinue
+            $whois = Invoke-RestMethod -Uri "https://whois.domaintools.com/$baseDomain" -TimeoutSec 5 -ErrorAction SilentlyContinue
             
             if ($whois -is [string]) {
-                # Parse common expiry date patterns
                 $patterns = @(
                     "Expir.*?:(.*?)(?:\n|$)",
                     "Expir.*?Date:(.*?)(?:\n|$)",
@@ -241,7 +426,6 @@ function Get-DomainExpiryDate {
                                 Status = "Active"
                             }
                         } catch {
-                            # Try different date formats
                             $formats = @(
                                 "yyyy-MM-dd",
                                 "dd/MM/yyyy",
@@ -261,23 +445,17 @@ function Get-DomainExpiryDate {
                                         DaysUntilExpiry = ($expiryDate - (Get-Date)).Days
                                         Status = "Active"
                                     }
-                                } catch {
-                                    continue
-                                }
+                                } catch { continue }
                             }
                         }
                     }
                 }
             }
-        } catch {
-            # WHOIS failed, continue to next method
-        }
+        } catch {}
         
-        # Fallback to system WHOIS command if available
         try {
-            # This works on Unix/Linux systems
             if (Get-Command whois -ErrorAction SilentlyContinue) {
-                $whoisOutput = whois $domain
+                $whoisOutput = whois $baseDomain
                 if ($whoisOutput -match "Expir.*?Date:\s*(.+)$") {
                     $dateStr = $matches[1].Trim()
                     try {
@@ -288,7 +466,6 @@ function Get-DomainExpiryDate {
                             Status = "Active"
                         }
                     } catch {
-                        # Return raw string if parsing fails
                         return @{
                             ExpiryDate = $dateStr
                             DaysUntilExpiry = "N/A"
@@ -297,9 +474,7 @@ function Get-DomainExpiryDate {
                     }
                 }
             }
-        } catch {
-            # whois command failed
-        }
+        } catch {}
         
         return @{
             ExpiryDate = "N/A"
@@ -322,7 +497,6 @@ function Test-HTTPSFirst {
     $httpsUrl = "https://$domain"
     $httpUrl = "http://$domain"
     
-    # Try HTTPS first
     $httpsStatus = "No Response"
     $httpStatus = "Not Attempted"
     $protocol = "https"
@@ -341,14 +515,12 @@ function Test-HTTPSFirst {
             Status_Summary = "HTTPS: $httpsStatus | HTTP: Not Attempted"
         }
     } catch {
-        # HTTPS failed
         if ($_.Exception.Response) {
             $httpsStatus = $_.Exception.Response.StatusCode
         } else {
             $httpsStatus = "No Response"
         }
         
-        # Now try HTTP
         try {
             $response = Invoke-WebRequest -Uri $httpUrl -Method Head -TimeoutSec 3 -ErrorAction Stop
             $httpStatus = $response.StatusCode
@@ -368,7 +540,6 @@ function Test-HTTPSFirst {
                 $httpStatus = "No Response"
             }
             
-            # Both failed
             return @{
                 FinalURL = $finalUrl
                 StatusCode = $httpStatus
@@ -391,7 +562,6 @@ function Check-Redirect {
         $response = $request.GetResponse()
         $statusCode = [int]$response.StatusCode
         
-        # If it's a 3xx redirect
         if ($statusCode -ge 300 -and $statusCode -lt 400) {
             $location = $response.Headers["Location"]
             $response.Close()
@@ -481,7 +651,6 @@ foreach ($domainObj in $domainList) {
     $originalDomain = $domainObj.Domain.Trim()
     $counter++
     
-    # MINIMAL OUTPUT: Just show progress with domain name
     Write-Progress -Activity "Processing Domains" -Status "$counter/$total : $originalDomain" -PercentComplete (($counter / $total) * 100)
     Write-Host "Testing: $originalDomain"
     
@@ -501,16 +670,13 @@ foreach ($domainObj in $domainList) {
     $loopDetected = "No"
     $maxRedirectChecks = 3
     
-    # Check for redirects only if 3xx and not error
     if ($statusCode -match "^30[1278]$" -and $statusCode -notmatch "Error|Failed|Unreachable|No Response") {
         $seenUrls = @()
         
         for ($i = 0; $i -lt $maxRedirectChecks; $i++) {
             $redirectCheck = Check-Redirect -url $currentUrl
             
-            if ($redirectCheck.StatusCode -match "Error|Failed|Unreachable") {
-                break
-            }
+            if ($redirectCheck.StatusCode -match "Error|Failed|Unreachable") { break }
             
             $normalizedUrl = $currentUrl.ToLower().Replace("https://", "").Replace("http://", "").TrimEnd('/')
             
@@ -535,9 +701,7 @@ foreach ($domainObj in $domainList) {
                 
                 $fromHost = try { ([Uri]$redirectChain[-1].From).Host } catch { $redirectChain[-1].From }
                 $toHost = try { ([Uri]$redirectChain[-1].To).Host } catch { $redirectChain[-1].To }
-                if ($fromHost -eq $toHost) {
-                    break
-                }
+                if ($fromHost -eq $toHost) { break }
             } else {
                 break
             }
@@ -548,47 +712,38 @@ foreach ($domainObj in $domainList) {
     if ($protocol -eq "https") { $httpsCount++ }
     if ($statusCode -eq 200) { $successCount++ }
     
-    # Domain for DNS resolution
     $domainForDNS = $originalDomain
     
-    # Initialize result
     $result = [PSCustomObject]@{
-        # Basic Info
         Domain = $displayDomain
         Original_Domain = $originalDomain
         Protocol = $protocol
         HTTP_Status = $statusCode
         Status_Summary = $statusSummary
         
-        # IP and Network Info
         IP_Address = "N/A"
         Organization = "N/A"
         Handle = "N/A"
         ASN = "N/A"
         
-        # Location Info
         Location = "N/A"
         Country = "N/A"
         City = "N/A"
         Region = "N/A"
         
-        # CDN & Registration
         CDN_Provider = "None"
         Registrar = "N/A"
         ISP = "N/A"
         
-        # Domain Expiry Info - NEW FIELDS
         Expiry_Date = "N/A"
         Days_Until_Expiry = "N/A"
         Domain_Status = "N/A"
         
-        # Redirect Information
         Has_Redirects = $hasRedirects
         Redirect_Count = $redirectChain.Count
         Loop_Detected = $loopDetected
         Final_URL_After_Redirects = $finalUrlAfterRedirects
         
-        # Redirect details
         Redirect1_From = "N/A"
         Redirect1_To = "N/A"
         Redirect1_Status = "N/A"
@@ -604,7 +759,6 @@ foreach ($domainObj in $domainList) {
         Checked_At = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     }
     
-    # Get data for the domain
     try {
         # DNS resolution
         $dnsResult = Resolve-DnsName -Name $domainForDNS -Type A -ErrorAction Stop | Select-Object -First 1
@@ -621,7 +775,7 @@ foreach ($domainObj in $domainList) {
             $result.ISP = $geoData.ISP
         }
         
-        # WHOIS
+        # WHOIS (IP)
         $whoisData = Get-IPWhoisData -ipAddress $ipAddress
         
         if ($whoisData) {
@@ -645,23 +799,21 @@ foreach ($domainObj in $domainList) {
         $registrar = Get-DomainRegistrar -domain $originalDomain
         $result.Registrar = $registrar
         
-        # Domain Expiry Date - NEW FUNCTION CALL
-        $expiryInfo = Get-DomainExpiryDate -domain $originalDomain
+        # Domain Expiry Date
+        $baseDomain = Get-BaseDomain -domain $originalDomain
+        $expiryInfo = Get-DomainExpiryDate -domain $baseDomain
         $result.Expiry_Date = $expiryInfo.ExpiryDate
         $result.Days_Until_Expiry = $expiryInfo.DaysUntilExpiry
         $result.Domain_Status = $expiryInfo.Status
         
         # Count expiry stats
         if ($expiryInfo.DaysUntilExpiry -ne "N/A" -and $expiryInfo.DaysUntilExpiry -ne "Error") {
-            if ($expiryInfo.DaysUntilExpiry -lt 0) {
-                $expiredCount++
-            } elseif ($expiryInfo.DaysUntilExpiry -lt 30) {
-                $expiringSoonCount++
-            }
+            if ($expiryInfo.DaysUntilExpiry -lt 0) { $expiredCount++ }
+            elseif ($expiryInfo.DaysUntilExpiry -lt 30) { $expiringSoonCount++ }
         }
         
     } catch {
-        # Silent error - just continue
+        # Silent error
     }
     
     # Populate redirect details
@@ -677,13 +829,9 @@ foreach ($domainObj in $domainList) {
         $result."Redirect${redirectNum}_Status" = $redirect.Status
     }
     
-    # Add to results
     $results += $result
     
-    # Rate limiting
-    if ($counter % 20 -eq 0) {
-        Start-Sleep -Milliseconds 500
-    }
+    if ($counter % 20 -eq 0) { Start-Sleep -Milliseconds 500 }
 }
 
 # Export results
@@ -692,14 +840,12 @@ if ($results.Count -gt 0) {
     Write-Host "`nResults exported to: $OutputCsv" -ForegroundColor Green
 }
 
-# Simple completion message
 Write-Host "`n$("=" * 60)" -ForegroundColor Cyan
 Write-Host "PROCESSING COMPLETE" -ForegroundColor Green
 Write-Host "Domains processed: $counter" -ForegroundColor Yellow
 Write-Host "Output file: $OutputCsv" -ForegroundColor Yellow
 Write-Host "$("=" * 60)" -ForegroundColor Cyan
 
-# Statistics with expiry info
 if ($counter -gt 0) {
     Write-Host "`nQuick Stats:" -ForegroundColor Cyan
     Write-Host "  HTTPS: $httpsCount/$counter" -ForegroundColor Gray
