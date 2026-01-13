@@ -131,7 +131,7 @@ function Get-BaseDomain {
     
     $lastTwo = $parts[-2..-1] -join '.'
 
-   
+    # IMPORTANT: For expiry/registrar, you want registrable domain
     if ($RegistrableOnly) {
         if (($ccSLDs -contains $lastTwo) -and ($parts.Count -ge 3)) {
             return ($parts[-3..-1] -join '.')
@@ -497,12 +497,11 @@ function Get-DomainExpiryDate {
 
         if ([string]::IsNullOrWhiteSpace($text)) { return $null }
 
-        # NOTE: Verisign uses "Registry Expiry Date:"
         $patterns = @(
             '(?im)^\s*Registry\s*Expiry\s*Date\s*:\s*(.+?)\s*$',
             '(?im)^\s*Expiration\s*Date\s*:\s*(.+?)\s*$',
             '(?im)^\s*Expiry\s*Date\s*:\s*(.+?)\s*$',
-            '(?im)^\s*Expire\s*Date\s*:\s*(.+?)\s*$',   # <-- FIX: helps .by
+            '(?im)^\s*Expire\s*Date\s*:\s*(.+?)\s*$',
             '(?im)^\s*Expires\s*On\s*:\s*(.+?)\s*$',
             '(?im)^\s*Expires\s*:\s*(.+?)\s*$',
             '(?im)^\s*Expire\s*:\s*(.+?)\s*$',
@@ -572,7 +571,7 @@ function Get-DomainExpiryDate {
         } catch {}
     }
 
- 
+    # METHOD 2b: .by WHOIS via TCP (cctld)
     if ($tld -eq "by" -and -not $expiryInfo) {
         try {
             $byWhois = Invoke-WhoisQuery -Server "whois.cctld.by" -Query $baseDomain
@@ -587,8 +586,7 @@ function Get-DomainExpiryDate {
         } catch {}
     }
 
-    # METHOD 3: IMPORTANT FIX FOR .com/.net SUBDOMAINS (and missing whois command)
-    # Query Verisign directly via TCP. This is usually the most reliable for .com/.net.
+    # METHOD 3: .com/.net (Verisign TCP)
     if ($tld -in @("com","net") -and -not $expiryInfo) {
         try {
             $verisign = Invoke-WhoisQuery -Server "whois.verisign-grs.com" -Query $baseDomain
@@ -630,7 +628,7 @@ function Get-DomainExpiryDate {
         } catch {}
     }
 
-    # METHOD 5: domaintools (UseBasicParsing to avoid prompt)
+    # METHOD 5: domaintools
     if (-not $expiryInfo) {
         try {
             $headers = @{ "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" }
@@ -876,8 +874,12 @@ foreach ($domainObj in $domainList) {
     # Count statistics
     if ($protocol -eq "https") { $httpsCount++ }
     if ($statusCode -eq 200) { $successCount++ }
-    
-    $domainForDNS = $originalDomain
+
+    # FIX: DNS must use hostname only (strip scheme/path/port)
+    $domainForDNS = $originalDomain.Trim()
+    $domainForDNS = $domainForDNS -replace '^https?://', ''
+    $domainForDNS = $domainForDNS -replace '/.*$', ''
+    $domainForDNS = $domainForDNS.Split(':')[0]
     
     $result = [PSCustomObject]@{
         Domain = $displayDomain
@@ -925,42 +927,52 @@ foreach ($domainObj in $domainList) {
     }
     
     try {
-        # DNS resolution
-        $dnsResult = Resolve-DnsName -Name $domainForDNS -Type A -ErrorAction Stop | Select-Object -First 1
-        $ipAddress = $dnsResult.IPAddress
-        $result.IP_Address = $ipAddress
-        
-        # Geolocation
-        $geoData = Get-IPGeolocation -ipAddress $ipAddress
-        if ($geoData) {
-            $result.Location = $geoData.Location
-            $result.Country = $geoData.Country
-            $result.City = $geoData.City
-            $result.Region = $geoData.Region
-            $result.ISP = $geoData.ISP
+        # DNS resolution (FIX: handle CNAME-first results + fallback to AAAA)
+        $dnsRecords = Resolve-DnsName -Name $domainForDNS -Type A -ErrorAction Stop
+        $dnsA = $dnsRecords | Where-Object { $_.IPAddress } | Select-Object -First 1
+
+        if (-not $dnsA) {
+            $dnsAAAA = Resolve-DnsName -Name $domainForDNS -Type AAAA -ErrorAction SilentlyContinue |
+                       Where-Object { $_.IPAddress } | Select-Object -First 1
+            $dnsA = $dnsAAAA
         }
-        
-        # WHOIS (IP)
-        $whoisData = Get-IPWhoisData -ipAddress $ipAddress
-        
-        if ($whoisData) {
-            $result.Organization = $whoisData.Organization
-            $result.Handle = $whoisData.Handle
-            $result.ASN = $whoisData.ASN
+
+        if ($dnsA -and $dnsA.IPAddress) {
+            $ipAddress = $dnsA.IPAddress
+            $result.IP_Address = $ipAddress
+
+            # Geolocation
+            $geoData = Get-IPGeolocation -ipAddress $ipAddress
+            if ($geoData) {
+                $result.Location = $geoData.Location
+                $result.Country = $geoData.Country
+                $result.City = $geoData.City
+                $result.Region = $geoData.Region
+                $result.ISP = $geoData.ISP
+            }
+
+            # WHOIS (IP)
+            $whoisData = Get-IPWhoisData -ipAddress $ipAddress
             
-            if ($whoisData.Country -and $whoisData.Country -ne $result.Country) {
-                $result.Country = $whoisData.Country
+            if ($whoisData) {
+                $result.Organization = $whoisData.Organization
+                $result.Handle = $whoisData.Handle
+                $result.ASN = $whoisData.ASN
+                
+                if ($whoisData.Country -and $whoisData.Country -ne $result.Country) {
+                    $result.Country = $whoisData.Country
+                }
+            }
+
+            # CDN Detection
+            $cdnProvider = Detect-CDN -organization $result.Organization -handle $result.Handle -asn $result.ASN -isp $result.ISP
+            if ($cdnProvider -ne "None") {
+                $result.CDN_Provider = $cdnProvider
+                $cdnCount++
             }
         }
         
-        # CDN Detection
-        $cdnProvider = Detect-CDN -organization $result.Organization -handle $result.Handle -asn $result.ASN -isp $result.ISP
-        if ($cdnProvider -ne "None") {
-            $result.CDN_Provider = $cdnProvider
-            $cdnCount++
-        }
-        
-        # Always use registrable domain for registrar/expiry (fixes deep subdomains)
+        # Always use registrable domain for registrar/expiry
         $baseDomain = Get-BaseDomain -domain $originalDomain -RegistrableOnly
         
         # Registrar
@@ -968,7 +980,6 @@ foreach ($domainObj in $domainList) {
         $result.Registrar = $registrar
         
         # Expiry
-        Write-Host "  Checking expiry for $baseDomain..." -ForegroundColor DarkGray
         $expiryInfo = Get-DomainExpiryDate -domain $baseDomain
         $result.Expiry_Date = $expiryInfo.ExpiryDate
         $result.Days_Until_Expiry = $expiryInfo.DaysUntilExpiry
@@ -1028,4 +1039,3 @@ try {
         Copy-Item -Path $OutputCsv -Destination $compareFile -Force
     }
 } catch { }
-
