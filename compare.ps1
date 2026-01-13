@@ -641,7 +641,7 @@ foreach ($currentRow in $currentData) {
         if ($existedInWeek1) {
             $prevRow1 = $previousDomains1[$domainKey]
             foreach ($column in $allColumns) {
-                if ($column -match "^(Domain|Checked_At|Row_Color|Change_)") { continue }
+                   if ($column -match "^(Domain|Checked_At|Row_Color|Change_|Days_Until_Expiry)$") { continue }
 
                 $currentValue = $currentRow.$column
                 $previousValue = $prevRow1.$column
@@ -662,7 +662,7 @@ foreach ($currentRow in $currentData) {
         if ($existedInWeek2) {
             $prevRow2 = $previousDomains2[$domainKey]
             foreach ($column in $allColumns) {
-                if ($column -match "^(Domain|Checked_At|Row_Color|Change_)") { continue }
+                    if ($column -match "^(Domain|Checked_At|Row_Color|Change_|Days_Until_Expiry)$") { continue }
 
                 $currentValue = $currentRow.$column
                 $previousValue = $prevRow2.$column
