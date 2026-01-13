@@ -12,7 +12,7 @@
 # - SIMPLE + CORRECT counting using Measure-Object (no .Count)
 # - Dashboard percentages based on CURRENT WEEK domains (deleted excluded)
 # - Adds "Total Domain Changes" = New + Modified + Deleted
-#
+# - Days_Until_Expiry will “change” every day even when nothing meaningful changed, ignored in modify report.
 # Added (THIS UPDATE):
 # - HTML row selection (checkboxes)
 # - Export Selected to CSV (client-side download)
@@ -811,3 +811,4 @@ Write-Host "For PDF: Export Selected to PDF opens a print dialog -> choose 'Save
 Write-Host "$('=' * 70)" -ForegroundColor Cyan
 
 Write-Host "`nComparison script completed successfully!" -ForegroundColor Green
+
